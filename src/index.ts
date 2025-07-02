@@ -4,101 +4,160 @@ import express from "express";
 import { createServer } from "http";
 import { Server } from "socket.io";
 import qrcode from "qrcode";
+import { promises as fs } from "fs";
+import path from "path";
 
 const app = express();
 const server = createServer(app);
 const io = new Server(server);
 
-app.use(express.json());
-const n8nUrl = process.env.N8N_URL || "https://n8n.yohancloud.biz.id";
 
+const PORT = process.env.PORT || 3000;
+const n8nUrl = process.env.N8N_URL!
+
+const STATUS_FILE_PATH = path.join(__dirname, "connection-status.json");
+const QR_FILE_PATH = path.join(__dirname, "qr-code.txt");
+
+
+app.use(express.json());
 
 let socket: WASocket;
-let qrCodeData;
-let isConnected = false;
+
+
+
+async function writeConnectionStatus(status: { isConnected: boolean }) {
+  try {
+    await fs.writeFile(STATUS_FILE_PATH, JSON.stringify(status, null, 2));
+  } catch (error) {
+    console.error("Gagal menulis status koneksi:", error);
+  }
+}
+
+async function readConnectionStatus(): Promise<{ isConnected: boolean }> {
+  try {
+    const data = await fs.readFile(STATUS_FILE_PATH, "utf-8");
+    return JSON.parse(data);
+  } catch (error) {
+    return { isConnected: false }; 
+  }
+}
+
+async function deleteFile(filePath: string) {
+  try {
+    await fs.unlink(filePath);
+  } catch (error: any) {
+    if (error.code !== 'ENOENT') { 
+      console.error(`Gagal menghapus file ${filePath}:`, error);
+    }
+  }
+}
+
+
 
 async function main() {
   const { state, saveCreds } = await useMultiFileAuthState("cache");
 
   socket = makeWASocket({
     auth: state,
-    printQRInTerminal: false, // We will handle the QR code manually
+    printQRInTerminal: false, 
   });
 
-  socket.ev.on("connection.update", async (update : any) => {
+  socket.ev.on("connection.update", async (update: any) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      qrCodeData = await qrcode.toDataURL(qr);
-      isConnected = false;
-      io.emit("qr", qrCodeData); // Send QR to the frontend
-      io.emit("status", "Please scan the QR code to connect.");
+      console.log("QR Code diterima, simpan ke file...");
+      const qrCodeData = await qrcode.toDataURL(qr);
+      await fs.writeFile(QR_FILE_PATH, qrCodeData);
+      await writeConnectionStatus({ isConnected: false });
+      io.emit("qr", qrCodeData);
+      io.emit("status", "Silakan pindai QR code untuk terhubung.");
     }
 
     if (connection === "close") {
-      isConnected = false;
-      io.emit("status", "Connection closed. Retrying...");
       const shouldReconnect = (lastDisconnect?.error as any)?.output?.statusCode !== DisconnectReason.loggedOut;
+      
       if (shouldReconnect) {
-        console.log("Connection closed, reconnecting...");
+        console.log("Koneksi terputus, mencoba menyambungkan kembali...");
+        io.emit("status", "Koneksi terputus. Menyambungkan kembali...");
         main();
       } else {
-        qrCodeData = null; // Clear QR on logout
+        console.log("Koneksi ditutup karena kesalahan otentikasi. Hapus kredensial lama.");
+        await deleteFile(QR_FILE_PATH);
+        await writeConnectionStatus({ isConnected: false });
         io.emit("qr", null);
-        io.emit("status", "Connection closed due to authentication error. Please refresh to get a new QR code.");
-        console.log("Connection closed due to authentication error, please re-authenticate.");
+        io.emit("status", "Koneksi terputus. Silakan refresh untuk QR code baru.");
       }
     } else if (connection === "open") {
-      isConnected = true;
-      qrCodeData = null; // Clear QR on successful connection
+      console.log("Koneksi WhatsApp berhasil dibuka!");
+      await deleteFile(QR_FILE_PATH);
+      await writeConnectionStatus({ isConnected: true });
       io.emit("qr", null);
-      io.emit("status", "WhatsApp connected successfully!");
+      io.emit("status", "WhatsApp berhasil terhubung!");
       io.emit("connected");
-      console.log("Connection opened successfully!");
     }
   });
 
-  socket.ev.on("messages.upsert", async ({ messages } : any) => {
-    const number = messages[0].key.remoteJid;
-    const message = messages[0].message?.extendedTextMessage?.text ?? messages[0].message?.conversation;
-    console.log(`Received message from ${number}: ${message}`);
-    if (messages[0].key.fromMe) {
-        console.log("This is a message sent by the bot itself, ignoring...");
-        return;
+  socket.ev.on("messages.upsert", async ({ messages }: any) => {
+    const msg = messages[0];
+    if (msg.key.fromMe) return; 
+
+    const number = msg.key.remoteJid;
+    const message = msg.message?.extendedTextMessage?.text ?? msg.message?.conversation;
+    console.log(`Pesan diterima dari ${number}: ${message}`);
+
+    const payload = {
+      id: msg.key,
+      message: message,
+    };
+
+    
+    try {
+        await fetch(`${n8nUrl}/webhook-test/whatsapp`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+        });
+        await fetch(`${n8nUrl}/webhook/whatsapp`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+        });
+    } catch (error) {
+        console.error("Gagal mengirim webhook ke n8n:", error);
     }
-    // Ignore messages sent by the bot itself
-    await fetch(`${n8nUrl}/webhook-test/whatsapp`, {
-        method : "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          id : messages[0].key,
-          message: message,
-        })
-      });
-      await fetch(`${n8nUrl}/webhook/whatsapp`, {
-        method : "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          id : messages[0].key,
-          message: message,
-        })
-      });
   });
 
   socket.ev.on("creds.update", saveCreds);
 }
 
-// UI Integration
-app.get("/", (req, res) => {
+
+
+
+app.get("/", async (req, res) => {
+  const status = await readConnectionStatus();
+  let initialQr = null;
+  let initialStatus = "Menghubungkan...";
+  let isInitiallyConnected = status.isConnected;
+
+  if (isInitiallyConnected) {
+    initialStatus = "Berhasil Terkoneksi";
+  } else {
+    try {
+      initialQr = await fs.readFile(QR_FILE_PATH, "utf-8");
+      if (initialQr) {
+        initialStatus = "Silakan pindai QR code untuk terhubung.";
+      }
+    } catch (error) {
+      
+    }
+  }
+
   res.send(`
     <!DOCTYPE html>
-    <html lang="en">
+    <html lang="id">
     <head>
-        <meta charset="UTF-g">
+        <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>WhatsApp QR Login</title>
         <style>
@@ -106,20 +165,21 @@ app.get("/", (req, res) => {
             #container { text-align: center; background: white; padding: 40px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
             h1 { font-size: 24px; color: #1c1e21; }
             p { font-size: 16px; color: #606770; }
-            #qr-code { margin-top: 20px; display: none; }
-            #checkmark { display: none; margin-top: 20px; }
+            #qr-code { display: ${!isInitiallyConnected && initialQr ? 'block' : 'none'}; margin-top: 20px; }
+            #qr-code img { max-width: 100%; height: auto; }
+            #checkmark { display: ${isInitiallyConnected ? 'block' : 'none'}; margin-top: 20px; }
         </style>
         <script src="/socket.io/socket.io.js"></script>
     </head>
     <body>
         <div id="container">
-            <h1>WhatsApp Connection Status</h1>
-            <p id="status">Connecting...</p>
+            <h1>Status Koneksi WhatsApp</h1>
+            <p id="status">${initialStatus}</p>
             <div id="qr-code">
-                <img src="" alt="QR Code" />
+                <img src="${initialQr || ''}" alt="QR Code" />
             </div>
             <div id="checkmark">
-                <svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 24 24" fill="none" stroke="#28a745" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg>
+                <svg xmlns="http:
             </div>
         </div>
         <script>
@@ -130,10 +190,10 @@ app.get("/", (req, res) => {
             const statusP = document.getElementById('status');
 
             socket.on('qr', (qr) => {
+                checkmarkDiv.style.display = 'none';
                 if (qr) {
                     qrCodeImg.src = qr;
                     qrCodeDiv.style.display = 'block';
-                    checkmarkDiv.style.display = 'none';
                 } else {
                     qrCodeDiv.style.display = 'none';
                 }
@@ -153,39 +213,62 @@ app.get("/", (req, res) => {
   `);
 });
 
+
 app.get("/status", async (req, res) => {
-  const number:any = req.query.number ?? "";
+  const number = req.query.number;
   if (!number) {
-    res.status(400).send("Missing 'number' query parameter.");
-    return;
-  }
-
-  await socket.sendPresenceUpdate('composing',number);
-  res.status(200).json({ status: "success" });
-})
-
-app.post("/webhook/send", async (req, res) => {
-  if (!isConnected) {
-     res.status(409).send("WhatsApp not connected.");
+     res.status(400).json({ error: "Parameter 'number' tidak ditemukan." });
      return;
   }
-  const { number, message } = req.body;
-  if (!number || !message) {
-      res.status(400).send("Missing 'number' or 'message' in request body.");
-      return;
+
+  const status = await readConnectionStatus();
+  if (!status.isConnected) {
+     res.status(409).json({ error: "WhatsApp tidak terhubung." });
+     return;
   }
-  console.log(`Received webhook for ID: ${number}, Message: ${message}`);
+
   try {
-    await socket.sendMessage(number, { text: message });
-    res.status(200).send("Webhook received and message sent successfully");
+    await socket.sendPresenceUpdate('composing', number as string);
+    res.status(200).json({ status: "success" });
   } catch (error) {
-    console.error("Failed to send message:", error);
-    res.status(500).send("Failed to send message");
+    console.error("Gagal mengirim presence update:", error);
+    res.status(500).json({ error: "Gagal mengirim presence update." });
   }
 });
 
-server.listen(3000, () => {
-  console.log("Server is running on port 3000. Open http://localhost:3000 to see the UI.");
+
+app.post("/webhook/send", async (req, res) => {
+  const status = await readConnectionStatus();
+  if (!status.isConnected) {
+      res.status(409).json({ error: "WhatsApp tidak terhubung." });
+      return
+  }
+
+  const { number, message } = req.body;
+  if (!number || !message) {
+       res.status(400).json({ error: "Parameter 'number' atau 'message' tidak ditemukan." });
+       return
+  }
+
+  console.log(`Webhook diterima untuk ID: ${number}, Pesan: ${message}`);
+  try {
+    const [result]:any = await socket.onWhatsApp(number);
+    if (!result?.exists) {
+         res.status(404).json({ error: "Nomor tidak terdaftar di WhatsApp." });
+         return
+    }
+    await socket.sendMessage(result.jid, { text: message });
+    res.status(200).json({ status: "Pesan berhasil dikirim." });
+  } catch (error) {
+    console.error("Gagal mengirim pesan:", error);
+    res.status(500).json({ error: "Gagal mengirim pesan." });
+  }
+});
+
+
+
+server.listen(PORT, () => {
+  console.log(`🚀 Server berjalan di http://localhost:${PORT}`);
 });
 
 main();
